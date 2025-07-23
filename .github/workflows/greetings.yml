@@ -1,0 +1,92 @@
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  jidDecode
+} = require('@whiskeysockets/baileys');
+
+const { Boom } = require('@hapi/boom');
+const qrcode = require('qrcode-terminal');
+
+async function startBot() {
+  const { state, saveCreds } = await useMultiFileAuthState('./auth');
+
+  const sock = makeWASocket({ auth: state });
+
+  sock.ev.on('connection.update', (update) => {
+    const { connection, lastDisconnect, qr } = update;
+    if (qr) qrcode.generate(qr, { small: true });
+    if (connection === 'open') console.log('✅ Bot connected!');
+    if (connection === 'close') {
+      const shouldReconnect = new Boom(lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
+      if (shouldReconnect) startBot();
+    }
+  });
+
+  sock.ev.on('creds.update', saveCreds);
+
+  // 🧠 Group Command Handler
+  sock.ev.on('messages.upsert', async ({ messages }) => {
+    const msg = messages[0];
+    if (!msg.message) return;
+
+    const from = msg.key.remoteJid;
+    const isGroup = from.endsWith('@g.us');
+    const sender = msg.key.participant || msg.key.remoteJid;
+    const text = msg.message.conversation || msg.message.extendedTextMessage?.text;
+
+    if (!text) return;
+
+    const command = text.toLowerCase().trim();
+
+    if (command === '!help') {
+      await sock.sendMessage(from, {
+        text: `🛠 *Group Commands:*
+- !kick @user
+- !groupinfo
+- !tagall
+- !help`
+      });
+    }
+
+    // 🔒 Group-only commands
+    if (isGroup) {
+      const metadata = await sock.groupMetadata(from);
+      const isAdmin = metadata.participants.find(p => p.id === sender && p.admin);
+
+      if (!isAdmin) {
+        return await sock.sendMessage(from, { text: '❌ Only group admins can use this command.' });
+      }
+
+      // ✅ Kick Command
+      if (command.startsWith('!kick')) {
+        const mentioned = msg.message.extendedTextMessage?.contextInfo?.mentionedJid;
+        if (!mentioned) return await sock.sendMessage(from, { text: 'Mention someone to kick, e.g., !kick @user' });
+
+        await sock.groupParticipantsUpdate(from, mentioned, 'remove');
+        return await sock.sendMessage(from, { text: `👢 Kicked user.` });
+      }
+
+      // 🧾 Group Info
+      if (command === '!groupinfo') {
+        const name = metadata.subject;
+        const memberCount = metadata.participants.length;
+        await sock.sendMessage(from, {
+          text: `👥 *${name}*\nMembers: ${memberCount}`
+        });
+      }
+
+      // 🗣 Tag All
+      if (command === '!tagall') {
+        const mentions = metadata.participants.map(p => p.id);
+        const tagMsg = mentions.map(u => `@${u.split('@')[0]}`).join(' ');
+        await sock.sendMessage(from, {
+          text: `👋 ${tagMsg}`,
+          mentions
+        });
+      }
+    }
+  });
+}
+
+startBot();
